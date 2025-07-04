@@ -1,3 +1,5 @@
+// Copyright (C) 2025 Ethan Uppal. All rights reserved.
+
 use iced::widget::{
     button, column, container, horizontal_space, row, scrollable, text, vertical_space,
 };
