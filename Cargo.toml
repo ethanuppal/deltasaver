@@ -1,0 +1,10 @@
+[package]
+name = "deltasaver"
+version = "0.1.0"
+edition = "2024"
+authors = ["Ethan Uppal"]
+
+[dependencies]
+iced = { version = "0.13.1", features = ["highlighter", "tokio", "debug"] }
+tokio = { version = "1.46.0", features = ["fs"] }
+rfd = "0.13"
