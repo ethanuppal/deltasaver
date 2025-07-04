@@ -1,310 +1,514 @@
-use iced::highlighter;
-use iced::keyboard;
 use iced::widget::{
-    self, button, column, container, horizontal_space, pick_list, row, text, text_editor, toggler,
-    tooltip,
+    button, column, container, horizontal_space, row, scrollable, text, vertical_space,
 };
-use iced::{Center, Element, Fill, Font, Task, Theme};
+use iced::{Background, Border, Center, Color, Element, Fill, Font, Length, Task, Theme};
 
-use std::ffi;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::time::SystemTime;
+
+#[cfg(target_os = "linux")]
+compile_error!("Linux is not supported in this context.");
 
 pub fn main() -> iced::Result {
-    iced::application("Editor - Iced", Editor::update, Editor::view)
-        .theme(Editor::theme)
+    iced::application("DELTASAVER", Deltasaver::update, Deltasaver::view)
+        .theme(|_| Theme::Dark)
         .font(include_bytes!("../fonts/DTM-Mono.otf").as_slice())
         .default_font(Font::with_name("Determination Mono"))
-        .run_with(Editor::new)
+        .run_with(Deltasaver::new)
 }
 
-struct Editor {
-    file: Option<PathBuf>,
-    content: text_editor::Content,
-    theme: highlighter::Theme,
-    word_wrap: bool,
-    is_loading: bool,
-    is_dirty: bool,
+// tricky tony better not pull a trick
+const CHAPTER_COUNT: Chapter = 7;
+
+const BUILTIN_SLOT_MAX_INDEX: Slot = 2;
+
+const SPACING0_5: f32 = 0.5 * SPACING;
+const SPACING: f32 = 8.0;
+const SPACING1_5: f32 = 1.5 * SPACING;
+const SPACING2: f32 = 2.0 * SPACING;
+
+const TABLE_COLUMN_HEADER_SIZE: f32 = 24.0;
+const BUTTON_SIZE: f32 = 12.0;
+
+#[derive(Debug, Clone)]
+struct SaveFile {
+    path: PathBuf,
+    chapter: u8,
+    slot: u8,
+    hash: Option<String>,
+    modified: Option<SystemTime>,
+    is_local: bool,
+}
+
+impl SaveFile {
+    fn display_name(&self) -> String {
+        if self.is_local {
+            format!(
+                "Chapter {}, Slot {} ({})",
+                self.chapter,
+                self.slot + 1,
+                self.hash.as_ref().map(|h| &h[..8]).unwrap_or("local")
+            )
+        } else {
+            format!("Chapter {}, Slot {}", self.chapter, self.slot + 1)
+        }
+    }
+}
+
+type Chapter = u8;
+type Slot = u8;
+
+struct Deltasaver {
+    deltarune_saves_directory: PathBuf,
+    local_saves_directory: PathBuf,
+    game_saves: HashMap<(Chapter, Slot), SaveFile>,
+    local_saves: Vec<SaveFile>,
+    loading: bool,
 }
 
 #[derive(Debug, Clone)]
 enum Message {
-    ActionPerformed(text_editor::Action),
-    ThemeSelected(highlighter::Theme),
-    WordWrapToggled(bool),
-    NewFile,
-    OpenFile,
-    FileOpened(Result<(PathBuf, Arc<String>), Error>),
-    SaveFile,
-    FileSaved(Result<PathBuf, Error>),
+    SavesLoaded(Result<(HashMap<(Chapter, Slot), SaveFile>, Vec<SaveFile>), LoadError>),
+    RefreshSaves,
+    BackupSave(Chapter, Slot),
+    /// local save path, target chapter, slot
+    RestoreSave(PathBuf, Chapter, Slot),
+    DeleteLocalSave(PathBuf),
 }
 
-impl Editor {
+#[derive(Debug, Clone)]
+enum LoadError {
+    IoError(()),
+}
+
+impl Deltasaver {
     fn new() -> (Self, Task<Message>) {
+        let app_data_directory = dirs::data_local_dir()
+            .expect("You have no local storage directory. Are you sure you downloaded DELTARUNE?");
+
+        let deltarune_saves_directory = if cfg!(target_os = "windows") {
+            app_data_directory.join("DELTARUNE")
+        } else if cfg!(target_os = "macos") {
+            app_data_directory.join("com.tobyfox.deltarune")
+        } else {
+            unreachable!("Unsupported OS");
+        };
+
+        let local_saves_directory = app_data_directory.join("DELTASAVER");
+
+        if !local_saves_directory.exists() {
+            let _ = fs::create_dir_all(&local_saves_directory);
+        }
+
+        let app = Self {
+            deltarune_saves_directory: deltarune_saves_directory.clone(),
+            local_saves_directory: local_saves_directory.clone(),
+            game_saves: HashMap::new(),
+            local_saves: Vec::new(),
+            loading: true,
+        };
+
         (
-            Self {
-                file: None,
-                content: text_editor::Content::new(),
-                theme: highlighter::Theme::SolarizedDark,
-                word_wrap: true,
-                is_loading: true,
-                is_dirty: false,
-            },
-            Task::batch([
-                Task::perform(
-                    load_file(format!("{}/src/main.rs", env!("CARGO_MANIFEST_DIR"))),
-                    Message::FileOpened,
-                ),
-                widget::focus_next(),
-            ]),
+            app,
+            Task::perform(
+                load_saves(deltarune_saves_directory, local_saves_directory),
+                Message::SavesLoaded,
+            ),
         )
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::ActionPerformed(action) => {
-                self.is_dirty = self.is_dirty || action.is_edit();
-
-                self.content.perform(action);
-
-                Task::none()
-            }
-            Message::ThemeSelected(theme) => {
-                self.theme = theme;
-
-                Task::none()
-            }
-            Message::WordWrapToggled(word_wrap) => {
-                self.word_wrap = word_wrap;
-
-                Task::none()
-            }
-            Message::NewFile => {
-                if !self.is_loading {
-                    self.file = None;
-                    self.content = text_editor::Content::new();
+            Message::SavesLoaded(result) => {
+                self.loading = false;
+                match result {
+                    Ok((game_saves, local_saves)) => {
+                        self.game_saves = game_saves;
+                        self.local_saves = local_saves;
+                    }
+                    Err(_) => {
+                        // Handle error - maybe show a message to user
+                    }
                 }
-
                 Task::none()
             }
-            Message::OpenFile => {
-                if self.is_loading {
-                    Task::none()
-                } else {
-                    self.is_loading = true;
-
-                    Task::perform(open_file(), Message::FileOpened)
-                }
+            Message::RefreshSaves => {
+                self.loading = true;
+                Task::perform(
+                    load_saves(
+                        self.deltarune_saves_directory.clone(),
+                        self.local_saves_directory.clone(),
+                    ),
+                    Message::SavesLoaded,
+                )
             }
-            Message::FileOpened(result) => {
-                self.is_loading = false;
-                self.is_dirty = false;
-
-                if let Ok((path, contents)) = result {
-                    self.file = Some(path);
-                    self.content = text_editor::Content::with_text(&contents);
-                }
-
-                Task::none()
-            }
-            Message::SaveFile => {
-                if self.is_loading {
-                    Task::none()
-                } else {
-                    self.is_loading = true;
-
+            Message::BackupSave(chapter, slot) => {
+                if let Some(save) = self.game_saves.get(&(chapter, slot)) {
                     Task::perform(
-                        save_file(self.file.clone(), self.content.text()),
-                        Message::FileSaved,
+                        backup_save(
+                            save.path.clone(),
+                            self.local_saves_directory.clone(),
+                            chapter,
+                            slot,
+                        ),
+                        |_| Message::RefreshSaves,
                     )
+                } else {
+                    Task::none()
                 }
             }
-            Message::FileSaved(result) => {
-                self.is_loading = false;
-
-                if let Ok(path) = result {
-                    self.file = Some(path);
-                    self.is_dirty = false;
-                }
-
-                Task::none()
+            Message::RestoreSave(local_path, chapter, slot) => Task::perform(
+                restore_save(
+                    local_path,
+                    self.deltarune_saves_directory.clone(),
+                    chapter,
+                    slot,
+                ),
+                |_| Message::RefreshSaves,
+            ),
+            Message::DeleteLocalSave(path) => {
+                Task::perform(delete_local_save(path), |_| Message::RefreshSaves)
             }
         }
     }
 
     fn view(&self) -> Element<Message> {
-        let controls = row![
-            action(new_icon(), "New file", Some(Message::NewFile)),
-            action(
-                open_icon(),
-                "Open file",
-                (!self.is_loading).then_some(Message::OpenFile)
-            ),
-            action(
-                save_icon(),
-                "Save file",
-                self.is_dirty.then_some(Message::SaveFile)
-            ),
-            horizontal_space(),
-            toggler(self.word_wrap)
-                .label("Word Wrap")
-                .on_toggle(Message::WordWrapToggled),
-            pick_list(
-                highlighter::Theme::ALL,
-                Some(self.theme),
-                Message::ThemeSelected
-            )
-            .text_size(14)
-            .padding([5, 10])
-        ]
-        .spacing(10)
-        .align_y(Center);
+        if self.loading {
+            return container(text("Loading saves..."))
+                .center_x(Fill)
+                .center_y(Fill)
+                .into();
+        }
 
-        let status = row![
-            text(if let Some(path) = &self.file {
-                let path = path.display().to_string();
+        let game_saves_column = self.create_game_saves_column();
+        let local_saves_column = self.create_local_saves_column();
 
-                if path.len() > 60 {
-                    format!("...{}", &path[path.len() - 40..])
-                } else {
-                    path
-                }
-            } else {
-                String::from("New file")
-            }),
-            horizontal_space(),
-            text({
-                let (line, column) = self.content.cursor_position();
-
-                format!("{}:{}", line + 1, column + 1)
-            })
-        ]
-        .spacing(10);
-
-        column![
-            controls,
-            text_editor(&self.content)
-                .height(Fill)
-                .on_action(Message::ActionPerformed)
-                .wrapping(if self.word_wrap {
-                    text::Wrapping::Word
-                } else {
-                    text::Wrapping::None
-                })
-                .highlight(
-                    self.file
-                        .as_deref()
-                        .and_then(Path::extension)
-                        .and_then(ffi::OsStr::to_str)
-                        .unwrap_or("rs"),
-                    self.theme,
-                )
-                .key_binding(|key_press| {
-                    match key_press.key.as_ref() {
-                        keyboard::Key::Character("s") if key_press.modifiers.command() => {
-                            Some(text_editor::Binding::Custom(Message::SaveFile))
-                        }
-                        _ => text_editor::Binding::from_key_press(key_press),
-                    }
-                }),
-            status,
-        ]
-        .spacing(10)
-        .padding(10)
+        container(
+            row![
+                game_saves_column,
+                vertical_space().width(SPACING2),
+                local_saves_column
+            ]
+            .height(Fill),
+        )
+        .padding(SPACING1_5)
+        .height(Fill)
         .into()
     }
 
-    fn theme(&self) -> Theme {
-        if self.theme.is_dark() {
-            Theme::Dark
-        } else {
-            Theme::Light
+    fn create_game_saves_column(&self) -> Element<Message> {
+        let mut content = column![text("Game Saves").size(TABLE_COLUMN_HEADER_SIZE)].spacing(5);
+
+        for chapter in 1..=CHAPTER_COUNT {
+            let chapter_title = text(format!("Chapter {}", chapter)).size(SPACING2);
+            let mut slots_cell = column![].spacing(SPACING);
+
+            for slot in 0..=BUILTIN_SLOT_MAX_INDEX {
+                let slot_content = if let Some(save) = self.game_saves.get(&(chapter, slot)) {
+                    column![
+                        button(text(format!("Slot {}", slot + 1)).size(BUTTON_SIZE))
+                            .on_press(Message::BackupSave(chapter, slot))
+                            .width(Length::Fixed(80.0)),
+                        vertical_space().height(SPACING),
+                        text(format!(
+                            "Modified: {}",
+                            save.modified
+                                .map(|t| format!("{:?}", t))
+                                .unwrap_or("Unknown".to_string())
+                        ))
+                        .size(10)
+                    ]
+                } else {
+                    column![
+                        button(text(format!("Slot {}", slot + 1)).size(BUTTON_SIZE))
+                            .width(Length::Fixed(80.0)),
+                        text("Empty").size(10)
+                    ]
+                };
+
+                slots_cell = slots_cell.push(
+                    container(slot_content.width(Length::Fill))
+                        .padding(SPACING)
+                        .style(textbox_style),
+                );
+            }
+
+            content = content.push(chapter_title).push(slots_cell);
+        }
+
+        container(
+            scrollable(row![
+                content,
+                horizontal_space().width(Length::Fixed(SPACING2))
+            ])
+            .height(Fill)
+            .width(Fill),
+        )
+        .padding(SPACING1_5)
+        .style(column_style)
+        .width(Fill)
+        .height(Fill)
+        .into()
+    }
+
+    fn create_local_saves_column(&self) -> Element<Message> {
+        let mut content =
+            column![text("Local Saves").size(TABLE_COLUMN_HEADER_SIZE)].spacing(SPACING);
+
+        let mut saves_by_chapter: HashMap<Chapter, Vec<&SaveFile>> = HashMap::new();
+        for save in &self.local_saves {
+            saves_by_chapter
+                .entry(save.chapter)
+                .or_insert_with(Vec::new)
+                .push(save);
+        }
+
+        for chapter in 1..=CHAPTER_COUNT {
+            let chapter_title = text(format!("Chapter {}", chapter)).size(16);
+
+            if let Some(saves) = saves_by_chapter.get(&chapter) {
+                let mut slots_by_slot: HashMap<Slot, Vec<&SaveFile>> = HashMap::new();
+                for save in saves {
+                    slots_by_slot
+                        .entry(save.slot)
+                        .or_insert_with(Vec::new)
+                        .push(save);
+                }
+
+                let mut chapter_content = column![chapter_title].spacing(SPACING);
+
+                for slot in 0..=BUILTIN_SLOT_MAX_INDEX {
+                    if let Some(slot_saves) = slots_by_slot.get(&slot) {
+                        let slot_title = text(format!("Slot {}", slot + 1)).size(14);
+                        let mut slot_cell = column![].spacing(SPACING);
+
+                        for save in slot_saves {
+                            let save_content = column![
+                                button(text(save.display_name()).size(10))
+                                    .on_press(Message::RestoreSave(
+                                        save.path.clone(),
+                                        chapter,
+                                        slot
+                                    ))
+                                    .width(Length::Fixed(120.0)),
+                                button(text("Delete").size(10))
+                                    .on_press(Message::DeleteLocalSave(save.path.clone()))
+                                    .width(Length::Fixed(120.0)),
+                                vertical_space().height(SPACING),
+                                text(format!(
+                                    "Modified: {}",
+                                    save.modified
+                                        .map(|t| format!("{:?}", t))
+                                        .unwrap_or("Unknown".to_string())
+                                ))
+                                .size(8)
+                            ]
+                            .spacing(2);
+
+                            slot_cell = slot_cell.push(
+                                container(save_content.width(Length::Fill))
+                                    .padding(SPACING)
+                                    .style(textbox_style),
+                            );
+                        }
+
+                        chapter_content = chapter_content.push(slot_title).push(slot_cell);
+                    }
+                }
+
+                content = content.push(chapter_content);
+            } else {
+                content = content.push(chapter_title).push(text("No saves").size(12));
+            }
+        }
+
+        container(
+            scrollable(row![
+                content,
+                horizontal_space().width(Length::Fixed(SPACING2))
+            ])
+            .height(Fill)
+            .width(Fill),
+        )
+        .padding(SPACING1_5)
+        .style(column_style)
+        .width(Fill)
+        .height(Fill)
+        .into()
+    }
+}
+
+fn container_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgb(0.1, 0.1, 0.1))),
+        border: Border {
+            radius: SPACING0_5.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn textbox_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::BLACK)),
+        border: Border {
+            color: Color::WHITE,
+            width: SPACING0_5,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn column_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgb(0.05, 0.05, 0.05))),
+        border: Border {
+            radius: 8.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+async fn load_saves(
+    deltarune_directory: PathBuf,
+    local_directory: PathBuf,
+) -> Result<(HashMap<(Chapter, Slot), SaveFile>, Vec<SaveFile>), LoadError> {
+    let mut game_saves = HashMap::new();
+    let mut local_saves = Vec::new();
+
+    if deltarune_directory.exists() {
+        let entries = fs::read_dir(&deltarune_directory).map_err(|e| LoadError::IoError(()))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| LoadError::IoError(()))?;
+            let path = entry.path();
+
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                println!("Found game file: {}", filename);
+                if let Some((chapter, slot)) = parse_save_filename(filename) {
+                    println!("Parsed as chapter {} slot {}", chapter, slot);
+                    let modified = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+                    let save = SaveFile {
+                        path: path.clone(),
+                        chapter,
+                        slot,
+                        hash: None,
+                        modified,
+                        is_local: false,
+                    };
+                    game_saves.insert((chapter, slot), save);
+                } else {
+                    println!("Could not parse filename: {}", filename);
+                }
+            }
         }
     }
-}
 
-#[derive(Debug, Clone)]
-pub enum Error {
-    DialogClosed,
-    IoError(io::ErrorKind),
-}
+    // Load local saves
+    if local_directory.exists() {
+        let entries = fs::read_dir(&local_directory).map_err(|e| LoadError::IoError(()))?;
 
-async fn open_file() -> Result<(PathBuf, Arc<String>), Error> {
-    let picked_file = rfd::AsyncFileDialog::new()
-        .set_title("Open a text file...")
-        .pick_file()
-        .await
-        .ok_or(Error::DialogClosed)?;
+        for entry in entries {
+            let entry = entry.map_err(|e| LoadError::IoError(()))?;
+            let path = entry.path();
 
-    load_file(picked_file).await
-}
-
-async fn load_file(path: impl Into<PathBuf>) -> Result<(PathBuf, Arc<String>), Error> {
-    let path = path.into();
-
-    let contents = tokio::fs::read_to_string(&path)
-        .await
-        .map(Arc::new)
-        .map_err(|error| Error::IoError(error.kind()))?;
-
-    Ok((path, contents))
-}
-
-async fn save_file(path: Option<PathBuf>, contents: String) -> Result<PathBuf, Error> {
-    let path = if let Some(path) = path {
-        path
-    } else {
-        rfd::AsyncFileDialog::new()
-            .save_file()
-            .await
-            .as_ref()
-            .map(rfd::FileHandle::path)
-            .map(Path::to_owned)
-            .ok_or(Error::DialogClosed)?
-    };
-
-    tokio::fs::write(&path, contents)
-        .await
-        .map_err(|error| Error::IoError(error.kind()))?;
-
-    Ok(path)
-}
-
-fn action<'a, Message: Clone + 'a>(
-    content: impl Into<Element<'a, Message>>,
-    label: &'a str,
-    on_press: Option<Message>,
-) -> Element<'a, Message> {
-    let action = button(container(content).center_x(30));
-
-    if let Some(on_press) = on_press {
-        tooltip(
-            action.on_press(on_press),
-            label,
-            tooltip::Position::FollowCursor,
-        )
-        .style(container::rounded_box)
-        .into()
-    } else {
-        action.style(button::secondary).into()
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                if let Some((chapter, slot, hash)) = parse_local_save_filename(filename) {
+                    let modified = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+                    let save = SaveFile {
+                        path: path.clone(),
+                        chapter,
+                        slot,
+                        hash: Some(hash),
+                        modified,
+                        is_local: true,
+                    };
+                    local_saves.push(save);
+                }
+            }
+        }
     }
+
+    Ok((game_saves, local_saves))
 }
 
-fn new_icon<'a, Message>() -> Element<'a, Message> {
-    icon('\u{0e800}')
+fn parse_save_filename(filename: &str) -> Option<(Chapter, Slot)> {
+    println!("Parsing filename: {}", filename);
+    if filename.starts_with("filech") {
+        let parts: Vec<&str> = filename[6..].split('_').collect();
+        println!("Parts: {:?}", parts);
+        if parts.len() == 2 {
+            if let (Ok(chapter), Ok(slot)) = (parts[0].parse::<u8>(), parts[1].parse::<u8>()) {
+                if slot <= 2 {
+                    println!("Successfully parsed: chapter {}, slot {}", chapter, slot);
+                    return Some((chapter, slot));
+                } else {
+                    println!("Ignoring slot {} (only 0-2 are save slots)", slot);
+                }
+            }
+        }
+    }
+    println!("Failed to parse filename: {}", filename);
+    None
 }
 
-fn save_icon<'a, Message>() -> Element<'a, Message> {
-    icon('\u{0e801}')
+fn parse_local_save_filename(filename: &str) -> Option<(Chapter, Slot, String)> {
+    if filename.starts_with("filech") {
+        let parts: Vec<&str> = filename[6..].split('_').collect();
+        if parts.len() >= 3 {
+            if let (Ok(chapter), Ok(slot)) = (parts[0].parse::<u8>(), parts[1].parse::<u8>()) {
+                if slot <= 2 {
+                    return Some((chapter, slot, parts[2].to_string()));
+                }
+            }
+        }
+    }
+    None
 }
 
-fn open_icon<'a, Message>() -> Element<'a, Message> {
-    icon('\u{0f115}')
+async fn backup_save(
+    source_path: PathBuf,
+    local_directory: PathBuf,
+    chapter: Chapter,
+    slot: Slot,
+) -> Result<(), io::Error> {
+    let contents = fs::read(&source_path)?;
+    let hash = format!("{:x}", Sha256::digest(&contents));
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap();
+    let filename = format!(
+        "filech{}_{}_{}_{}_{}",
+        chapter,
+        slot,
+        hash,
+        now.as_secs(),
+        now.subsec_nanos()
+    );
+    let dest_path = local_directory.join(filename);
+    fs::write(dest_path, contents)?;
+    Ok(())
 }
 
-fn icon<'a, Message>(codepoint: char) -> Element<'a, Message> {
-    const ICON_FONT: Font = Font::with_name("editor-icons");
+async fn restore_save(
+    local_path: PathBuf,
+    deltarune_directory: PathBuf,
+    chapter: Chapter,
+    slot: Slot,
+) -> Result<(), io::Error> {
+    let contents = fs::read(&local_path)?;
+    let dest_path = deltarune_directory.join(format!("filech{}_{}", chapter, slot));
+    fs::write(dest_path, contents)?;
+    Ok(())
+}
 
-    text(codepoint).font(ICON_FONT).into()
+async fn delete_local_save(path: PathBuf) -> Result<(), io::Error> {
+    fs::remove_file(path)
 }
